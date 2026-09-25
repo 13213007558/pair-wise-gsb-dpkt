@@ -43,6 +43,8 @@ ORIGINATOR_ID = 9
 CLUSTER_LIST = 10
 MP_REACH_NLRI = 14
 MP_UNREACH_NLRI = 15
+AS4_PATH = 17
+AS4_AGGREGATOR = 18
 
 # Origin Types
 ORIGIN_IGP = 0
@@ -54,6 +56,9 @@ AS_SET = 1
 AS_SEQUENCE = 2
 AS_CONFED_SEQUENCE = 3
 AS_CONFED_SET = 4
+
+# Reserved AS number used by 4-octet-AS speakers toward legacy peers - RFC 6793
+AS_TRANS = 23456
 
 # Reserved Communities Types
 NO_EXPORT = 0xffffff01
@@ -79,6 +84,7 @@ CAPABILITY = 2
 # Capability Types
 CAP_MULTIPROTOCOL = 1
 CAP_ROUTE_REFRESH = 2
+CAP_AS4 = 65
 
 # NOTIFICATION Error Codes
 MESSAGE_HEADER_ERROR = 1
@@ -146,13 +152,22 @@ class BGP(dpkt.Packet):
         ('type', 'B', OPEN)
     )
 
+    # Session capability: set to True (or pass asn4=True) when the peer
+    # negotiated the 4-octet AS number capability (RFC 6793), so that
+    # AS_PATH and AGGREGATOR are decoded with 4-octet AS numbers.
+    asn4 = False
+
+    def __init__(self, *args, **kwargs):
+        self.asn4 = kwargs.pop('asn4', self.asn4)
+        dpkt.Packet.__init__(self, *args, **kwargs)
+
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         self.data = self.data[:self.len - self.__hdr_len__]
         if self.type == OPEN:
             self.data = self.open = self.Open(self.data)
         elif self.type == UPDATE:
-            self.data = self.update = self.Update(self.data)
+            self.data = self.update = self.Update(self.data, asn4=self.asn4)
         elif self.type == NOTIFICATION:
             self.data = self.notification = self.Notification(self.data)
         elif self.type == KEEPALIVE:
@@ -221,12 +236,24 @@ class BGP(dpkt.Packet):
                     dpkt.Packet.unpack(self, buf)
                     self.data = self.data[:self.len]
 
+                    if self.code == CAP_AS4 and self.len == 4:
+                        # 4-octet AS number capability - RFC 6793
+                        self.asn = struct.unpack('>I', self.data)[0]
+
     class Update(dpkt.Packet):
         __hdr_defaults__ = {
             'withdrawn': [],
             'attributes': [],
             'announced': []
         }
+
+        # Session capability: True when the peer uses 4-octet AS numbers
+        # in AS_PATH and AGGREGATOR (RFC 6793).
+        asn4 = False
+
+        def __init__(self, *args, **kwargs):
+            self.asn4 = kwargs.pop('asn4', self.asn4)
+            dpkt.Packet.__init__(self, *args, **kwargs)
 
         def unpack(self, buf):
             self.data = buf
@@ -247,7 +274,7 @@ class BGP(dpkt.Packet):
             self.data = self.data[2:]
             l_ = []
             while plen > 0:
-                attr = self.Attribute(self.data)
+                attr = self.Attribute(self.data, asn4=self.asn4)
                 self.data = self.data[len(attr):]
                 plen -= len(attr)
                 l_.append(attr)
@@ -276,11 +303,84 @@ class BGP(dpkt.Packet):
                 b''.join(map(bytes, self.attributes)) + \
                 b''.join(map(bytes, self.announced))
 
+        def _find_attributes(self, type_):
+            return [a for a in self.attributes if a.type == type_]
+
+        @property
+        def as_path(self):
+            """Raw AS_PATH attribute payload (first occurrence), or None."""
+            attrs = self._find_attributes(AS_PATH)
+            return attrs[0].as_path if attrs else None
+
+        @property
+        def as4_path(self):
+            """Raw AS4_PATH attribute payload (first occurrence), or None."""
+            attrs = self._find_attributes(AS4_PATH)
+            return attrs[0].as4_path if attrs else None
+
+        @property
+        def effective_as_path(self):
+            """AS path merged from AS_PATH and AS4_PATH per RFC 6793.
+
+            Returns a list of ASPathSegment4 (4-octet AS numbers) preserving
+            AS_SEQUENCE/AS_SET/confederation segment boundaries. AS_TRANS in
+            AS_PATH is never treated as a real AS number: when AS4_PATH is
+            present and shorter than AS_PATH (using the RFC 6793 path count,
+            where an AS_SET counts as 1 and confederation segments are not
+            counted), the leading counted AS hops of AS_PATH are prepended to
+            AS4_PATH. If AS4_PATH is missing, or not shorter than AS_PATH,
+            AS_PATH alone is the effective path.
+
+            This is a read-only view; the parsed attributes are never
+            modified, so an unmodified UPDATE re-encodes identically.
+            """
+            as_path = self.as_path
+            as4_path = self.as4_path
+            if as_path is None:
+                segments = as4_path.segments if as4_path is not None else []
+                return [_segment4(s) for s in segments]
+            if as4_path is None:
+                return [_segment4(s) for s in as_path.segments]
+            n = as_path.as_count() - as4_path.as_count()
+            if n <= 0:
+                # AS4_PATH is not shorter than AS_PATH; ignore it (RFC 6793).
+                return [_segment4(s) for s in as_path.segments]
+            return _path_prefix(as_path.segments, n) + \
+                [_segment4(s) for s in as4_path.segments]
+
+        @property
+        def effective_aggregator(self):
+            """Aggregator paired per RFC 6793.
+
+            Returns the AGGREGATOR payload, unless its AS number is AS_TRANS
+            and an AS4_AGGREGATOR attribute is present, in which case the
+            AS4_AGGREGATOR payload is returned. Returns None when neither
+            attribute is present.
+            """
+            attrs = self._find_attributes(AGGREGATOR)
+            aggregator = attrs[0].aggregator if attrs else None
+            attrs = self._find_attributes(AS4_AGGREGATOR)
+            as4_aggregator = attrs[0].as4_aggregator if attrs else None
+            if aggregator is not None and aggregator.asn != AS_TRANS:
+                # AS4_AGGREGATOR must be ignored (RFC 6793).
+                return aggregator
+            if as4_aggregator is not None:
+                return as4_aggregator
+            return aggregator
+
         class Attribute(dpkt.Packet):
             __hdr__ = (
                 ('flags', 'B', 0),
                 ('type', 'B', 0)
             )
+
+            # Session capability: True when the peer uses 4-octet AS
+            # numbers in AS_PATH and AGGREGATOR (RFC 6793).
+            asn4 = False
+
+            def __init__(self, *args, **kwargs):
+                self.asn4 = kwargs.pop('asn4', self.asn4)
+                dpkt.Packet.__init__(self, *args, **kwargs)
 
             @property
             def optional(self):
@@ -329,7 +429,7 @@ class BGP(dpkt.Packet):
                 if self.type == ORIGIN:
                     self.data = self.origin = self.Origin(self.data)
                 elif self.type == AS_PATH:
-                    self.data = self.as_path = self.ASPath(self.data)
+                    self.data = self.as_path = self.ASPath(self.data, asn4=self.asn4)
                 elif self.type == NEXT_HOP:
                     self.data = self.next_hop = self.NextHop(self.data)
                 elif self.type == MULTI_EXIT_DISC:
@@ -339,7 +439,7 @@ class BGP(dpkt.Packet):
                 elif self.type == ATOMIC_AGGREGATE:
                     self.data = self.atomic_aggregate = self.AtomicAggregate(self.data)
                 elif self.type == AGGREGATOR:
-                    self.data = self.aggregator = self.Aggregator(self.data)
+                    self.data = self.aggregator = self.Aggregator(self.data, asn4=self.asn4)
                 elif self.type == COMMUNITIES:
                     self.data = self.communities = self.Communities(self.data)
                 elif self.type == ORIGINATOR_ID:
@@ -350,6 +450,11 @@ class BGP(dpkt.Packet):
                     self.data = self.mp_reach_nlri = self.MPReachNLRI(self.data)
                 elif self.type == MP_UNREACH_NLRI:
                     self.data = self.mp_unreach_nlri = self.MPUnreachNLRI(self.data)
+                elif self.type == AS4_PATH:
+                    # AS4_PATH always carries 4-octet AS numbers (RFC 6793)
+                    self.data = self.as4_path = self.ASPath(self.data, asn4=True)
+                elif self.type == AS4_AGGREGATOR:
+                    self.data = self.as4_aggregator = self.Aggregator4(self.data)
 
             def __len__(self):
                 if self.extended_length:
@@ -375,18 +480,37 @@ class BGP(dpkt.Packet):
                     'segments': []
                 }
 
+                # AS number width is explicit: True when the session
+                # negotiated 4-octet AS numbers (RFC 6793) or when parsing
+                # an AS4_PATH attribute. It is never guessed from the
+                # attribute length.
+                asn4 = False
+
+                def __init__(self, *args, **kwargs):
+                    self.asn4 = kwargs.pop('asn4', self.asn4)
+                    dpkt.Packet.__init__(self, *args, **kwargs)
+
                 def unpack(self, buf):
                     self.data = buf
                     l_ = []
-                    as4 = len(self.data) == 6
+                    Segment = self.ASPathSegment4 if self.asn4 else self.ASPathSegment
                     while self.data:
-                        if as4:
-                            seg = self.ASPathSegment4(self.data)
-                        else:
-                            seg = self.ASPathSegment(self.data)
+                        seg = Segment(self.data)
                         self.data = self.data[len(seg):]
                         l_.append(seg)
                     self.data = self.segments = l_
+
+                def as_count(self):
+                    """Path length per the RFC 6793 counting rules: each AS
+                    in an AS_SEQUENCE counts as 1, an AS_SET counts as 1, and
+                    confederation segments are not counted."""
+                    n = 0
+                    for seg in getattr(self, 'segments', []):
+                        if seg.type == AS_SEQUENCE:
+                            n += len(seg.path)
+                        elif seg.type == AS_SET:
+                            n += 1
+                    return n
 
                 def __len__(self):
                     return sum(map(len, self.data))
@@ -471,6 +595,36 @@ class BGP(dpkt.Packet):
             class Aggregator(dpkt.Packet):
                 __hdr__ = (
                     ('asn', 'H', 0),
+                    ('ip', 'I', 0)
+                )
+
+                # Session capability: True when the peer uses a 4-octet AS
+                # number in AGGREGATOR (RFC 6793).
+                asn4 = False
+
+                def __init__(self, *args, **kwargs):
+                    self.asn4 = kwargs.pop('asn4', self.asn4)
+                    dpkt.Packet.__init__(self, *args, **kwargs)
+
+                def unpack(self, buf):
+                    if self.asn4:
+                        self.asn, self.ip = struct.unpack('>II', buf[:8])
+                        self.data = buf[8:]
+                    else:
+                        dpkt.Packet.unpack(self, buf)
+
+                def __len__(self):
+                    return 8 if self.asn4 else self.__hdr_len__
+
+                def __bytes__(self):
+                    if self.asn4:
+                        return struct.pack('>II', self.asn, self.ip)
+                    return self.pack_hdr()
+
+            class Aggregator4(dpkt.Packet):
+                # AS4_AGGREGATOR payload: 4-octet AS number - RFC 6793
+                __hdr__ = (
+                    ('asn', 'I', 0),
                     ('ip', 'I', 0)
                 )
 
@@ -670,6 +824,38 @@ class BGP(dpkt.Packet):
             ('rsvd', 'B', 0),
             ('safi', 'B', SAFI_UNICAST)
         )
+
+
+def _segment4(seg, path=None):
+    """Copy an AS path segment into the 4-octet AS number representation."""
+    s = BGP.Update.Attribute.ASPath.ASPathSegment4()
+    s.type = seg.type
+    s.path = list(seg.path) if path is None else list(path)
+    s.len = len(s.path)
+    return s
+
+
+def _path_prefix(segments, count):
+    """Leading segments of an AS path covering exactly count AS hops (per
+    the RFC 6793 counting rules), preserving segment boundaries. An
+    AS_SEQUENCE may be split; an AS_SET counts as one hop and is taken
+    whole; confederation segments are kept but not counted."""
+    out = []
+    for seg in segments:
+        if count <= 0:
+            break
+        if seg.type == AS_SEQUENCE:
+            take = min(count, len(seg.path))
+            if take:
+                out.append(_segment4(seg, path=seg.path[:take]))
+                count -= take
+        elif seg.type == AS_SET:
+            out.append(_segment4(seg))
+            count -= 1
+        else:
+            # AS_CONFED_SEQUENCE / AS_CONFED_SET: not counted, kept as-is
+            out.append(_segment4(seg))
+    return out
 
 
 class RouteGeneric(dpkt.Packet):
@@ -1117,13 +1303,15 @@ def test_bgp_add_path_6_1_as_path():
     # test for https://github.com/kbandla/dpkt/issues/481
     # Error processing BGP data: packet 6 : message 1 of bgp-add-path.cap
     # https://packetlife.net/media/captures/bgp-add-path.cap
+    # this capture comes from a session that negotiated 4-octet AS numbers,
+    # so AS_PATH is decoded with asn4=True (the width is never guessed)
     __bgp = (
         b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x59\x02\x00\x00\x00\x30\x40\x01'
         b'\x01\x00\x40\x02\x06\x02\x01\x00\x00\xfb\xff\x40\x03\x04\x0a\x00\x0e\x01\x80\x04\x04\x00\x00\x00\x00'
         b'\x40\x05\x04\x00\x00\x00\x64\x80\x0a\x04\x0a\x00\x22\x04\x80\x09\x04\x0a\x00\x0f\x01\x00\x00\x00\x01'
         b'\x20\x05\x05\x05\x05\x00\x00\x00\x01\x20\xc0\xa8\x01\x05'
     )
-    bgp = BGP(__bgp)
+    bgp = BGP(__bgp, asn4=True)
     assert (__bgp == bytes(bgp))
     assert (len(bgp) == 89)
     assert (bgp.type == UPDATE)
@@ -1583,3 +1771,223 @@ def test_reservedcommunities():
 
     assert len(communities) == 4
     assert bytes(communities) == buf
+
+
+def _attr(flags, type_, value):
+    assert len(value) < 256
+    return struct.pack('BBB', flags, type_, len(value)) + value
+
+
+def _as_path_value(segments, asn4=False):
+    fmt = '>I' if asn4 else '>H'
+    out = b''
+    for seg_type, asns in segments:
+        out += struct.pack('BB', seg_type, len(asns))
+        for asn in asns:
+            out += struct.pack(fmt, asn)
+    return out
+
+
+def _bgp_update(attributes):
+    attrs = b''.join(attributes)
+    body = struct.pack('>H', 0) + struct.pack('>H', len(attrs)) + attrs
+    return b'\xff' * 16 + struct.pack('>HB', 19 + len(body), UPDATE) + body
+
+
+def test_rfc6793_merge_as4_path():
+    # AS_PATH seen at a legacy speaker: real ASes beyond the 2-octet range
+    # appear as AS_TRANS, multiple times
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [65001, AS_TRANS, AS_TRANS]),
+    ]))
+    as4_path = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [65551, 131072]),
+    ], asn4=True))
+    buf = _bgp_update([as_path, as4_path])
+
+    bgp = BGP(buf)
+    # unmodified UPDATE re-encodes exactly as received: no normalization
+    assert bytes(bgp) == buf
+
+    update = bgp.update
+    # raw attribute views
+    assert update.as_path.segments[0].type == AS_SEQUENCE
+    assert update.as_path.segments[0].path == [65001, AS_TRANS, AS_TRANS]
+    assert update.as4_path.segments[0].path == [65551, 131072]
+
+    # effective view: leading counted hops of AS_PATH prepended to AS4_PATH
+    eff = update.effective_as_path
+    assert [s.type for s in eff] == [AS_SEQUENCE, AS_SEQUENCE]
+    assert eff[0].path == [65001]
+    assert eff[1].path == [65551, 131072]
+    assert all(isinstance(s, BGP.Update.Attribute.ASPath.ASPathSegment4) for s in eff)
+
+
+def test_rfc6793_merge_sets_and_confed():
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_CONFED_SEQUENCE, [65010]),
+        (AS_SEQUENCE, [AS_TRANS, AS_TRANS]),
+        (AS_SET, [65020, 65021]),
+    ]))
+    as4_path = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [196608]),
+        (AS_SET, [196709, 196710]),
+    ], asn4=True))
+    buf = _bgp_update([as_path, as4_path])
+
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+
+    update = bgp.update
+    # RFC 6793 counting: confed = 0, sequence = 2, set = 1 -> 3
+    assert update.as_path.as_count() == 3
+    assert update.as4_path.as_count() == 2
+
+    # 1 leading counted hop from AS_PATH; confed boundary kept, set stays whole
+    eff = update.effective_as_path
+    assert [s.type for s in eff] == [AS_CONFED_SEQUENCE, AS_SEQUENCE, AS_SEQUENCE, AS_SET]
+    assert eff[0].path == [65010]
+    assert eff[1].path == [AS_TRANS]
+    assert eff[2].path == [196608]
+    assert eff[3].path == [196709, 196710]
+
+
+def test_rfc6793_as4_path_not_shorter_ignored():
+    # AS4_PATH longer than AS_PATH must not override it
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [AS_TRANS, AS_TRANS]),
+    ]))
+    as4_path = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [65536, 65537, 65538]),
+    ], asn4=True))
+    buf = _bgp_update([as_path, as4_path])
+
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+
+    eff = bgp.update.effective_as_path
+    assert [s.type for s in eff] == [AS_SEQUENCE]
+    assert eff[0].path == [AS_TRANS, AS_TRANS]
+
+
+def test_rfc6793_duplicate_attributes():
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [65001, AS_TRANS]),
+    ]))
+    as4_path1 = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [65551]),
+    ], asn4=True))
+    as4_path2 = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [99999]),
+    ], asn4=True))
+    buf = _bgp_update([as_path, as4_path1, as4_path2])
+
+    bgp = BGP(buf)
+    update = bgp.update
+    # all attributes preserved, in order, and re-encoded identically
+    assert len(update.attributes) == 3
+    assert bytes(bgp) == buf
+
+    # the first occurrence wins for the merged view
+    assert update.as4_path.segments[0].path == [65551]
+    eff = update.effective_as_path
+    assert [s.type for s in eff] == [AS_SEQUENCE, AS_SEQUENCE]
+    assert eff[0].path == [65001]
+    assert eff[1].path == [65551]
+
+
+def test_rfc6793_effective_as_path_without_as4():
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [65001, 65002]),
+        (AS_SET, [65003, 65004]),
+    ]))
+    bgp = BGP(_bgp_update([as_path]))
+    eff = bgp.update.effective_as_path
+    assert [s.type for s in eff] == [AS_SEQUENCE, AS_SET]
+    assert eff[0].path == [65001, 65002]
+    assert eff[1].path == [65003, 65004]
+
+    # AS4_PATH only, no AS_PATH
+    as4_path = _attr(0xc0, AS4_PATH, _as_path_value([
+        (AS_SEQUENCE, [65551]),
+    ], asn4=True))
+    bgp = BGP(_bgp_update([as4_path]))
+    assert bgp.update.as_path is None
+    eff = bgp.update.effective_as_path
+    assert [s.type for s in eff] == [AS_SEQUENCE]
+    assert eff[0].path == [65551]
+
+
+def test_rfc6793_aggregator_pairing():
+    # AGGREGATOR carrying AS_TRANS pairs with AS4_AGGREGATOR
+    agg = _attr(0xc0, AGGREGATOR, struct.pack('>HI', AS_TRANS, 0x0a000001))
+    agg4 = _attr(0xc0, AS4_AGGREGATOR, struct.pack('>II', 131072, 0x0a000001))
+    buf = _bgp_update([agg, agg4])
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    # raw views
+    assert bgp.update.attributes[0].aggregator.asn == AS_TRANS
+    assert bgp.update.attributes[1].as4_aggregator.asn == 131072
+    # effective view
+    e = bgp.update.effective_aggregator
+    assert e.asn == 131072
+    assert socket.inet_ntoa(struct.pack('>I', e.ip)) == '10.0.0.1'
+
+    # AGGREGATOR with a real 2-octet AS: AS4_AGGREGATOR must be ignored
+    agg = _attr(0xc0, AGGREGATOR, struct.pack('>HI', 65001, 0x0a000001))
+    bgp = BGP(_bgp_update([agg, agg4]))
+    assert bgp.update.effective_aggregator.asn == 65001
+
+    # AGGREGATOR alone
+    bgp = BGP(_bgp_update([agg]))
+    assert bgp.update.effective_aggregator.asn == 65001
+
+    # neither attribute
+    bgp = BGP(_bgp_update([]))
+    assert bgp.update.effective_aggregator is None
+
+
+def test_asn4_session_capability():
+    # on a 4-octet ASN session AS_PATH and AGGREGATOR use 4-octet AS numbers
+    as_path = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [65551, 131072]),
+    ], asn4=True))
+    agg = _attr(0xc0, AGGREGATOR, struct.pack('>II', 131072, 0x0a000001))
+    buf = _bgp_update([as_path, agg])
+
+    bgp = BGP(buf, asn4=True)
+    assert bgp.update.as_path.segments[0].path == [65551, 131072]
+    assert bgp.update.attributes[1].aggregator.asn == 131072
+    assert bytes(bgp) == buf
+
+    # without the capability the same wire format is decoded as 2-octet;
+    # a 6-byte AS_PATH is a sequence of two 2-octet AS numbers, never a
+    # guessed 4-octet one
+    as_path2 = _attr(0x40, AS_PATH, _as_path_value([
+        (AS_SEQUENCE, [1, 2]),
+    ]))
+    assert len(as_path2) - 3 == 6
+    bgp = BGP(_bgp_update([as_path2]))
+    segment = bgp.update.as_path.segments[0]
+    assert isinstance(segment, BGP.Update.Attribute.ASPath.ASPathSegment)
+    assert segment.path == [1, 2]
+
+
+def test_open_cap_as4():
+    buf = (
+        b'\x04'          # version
+        b'\xfd\xe8'      # asn (2-octet, AS_TRANS would be used if > 65535)
+        b'\x00\xb4'      # holdtime
+        b'\x01\x02\x03\x04'  # identifier
+        b'\x08'          # param_len
+        b'\x02'          # param type (CAPABILITY)
+        b'\x06'          # param len
+        b'\x41'          # capability code (CAP_AS4)
+        b'\x04'          # capability len
+        b'\x00\x01\x00\x0f'  # 4-octet AS number 65551
+    )
+    bgp_open = BGP.Open(buf)
+    assert bytes(bgp_open) == buf
+    cap = bgp_open.parameters[0].capability
+    assert cap.code == CAP_AS4
+    assert cap.asn == 65551
