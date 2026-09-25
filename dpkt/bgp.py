@@ -43,6 +43,8 @@ ORIGINATOR_ID = 9
 CLUSTER_LIST = 10
 MP_REACH_NLRI = 14
 MP_UNREACH_NLRI = 15
+AS4_PATH = 17
+AS4_AGGREGATOR = 18
 
 # Origin Types
 ORIGIN_IGP = 0
@@ -54,6 +56,9 @@ AS_SET = 1
 AS_SEQUENCE = 2
 AS_CONFED_SEQUENCE = 3
 AS_CONFED_SET = 4
+
+# Reserved AS Number - RFC 6793
+AS_TRANS = 23456
 
 # Reserved Communities Types
 NO_EXPORT = 0xffffff01
@@ -79,6 +84,7 @@ CAPABILITY = 2
 # Capability Types
 CAP_MULTIPROTOCOL = 1
 CAP_ROUTE_REFRESH = 2
+CAP_AS4 = 65
 
 # NOTIFICATION Error Codes
 MESSAGE_HEADER_ERROR = 1
@@ -146,13 +152,21 @@ class BGP(dpkt.Packet):
         ('type', 'B', OPEN)
     )
 
+    # Set to True (e.g. BGP(as4=True)) when the session negotiated the
+    # four-octet AS number capability (RFC 6793); AS_PATH is then decoded
+    # with 4-octet ASNs. Defaults to the classic 2-octet encoding. The
+    # width is never guessed from the attribute length.
+    as4 = False
+
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         self.data = self.data[:self.len - self.__hdr_len__]
         if self.type == OPEN:
             self.data = self.open = self.Open(self.data)
         elif self.type == UPDATE:
-            self.data = self.update = self.Update(self.data)
+            update = self.Update(as4=self.as4)
+            update.unpack(self.data)
+            self.data = self.update = update
         elif self.type == NOTIFICATION:
             self.data = self.notification = self.Notification(self.data)
         elif self.type == KEEPALIVE:
@@ -221,12 +235,20 @@ class BGP(dpkt.Packet):
                     dpkt.Packet.unpack(self, buf)
                     self.data = self.data[:self.len]
 
+                    if self.code == CAP_AS4 and self.len == 4:
+                        self.asn = struct.unpack('>I', self.data)[0]
+
     class Update(dpkt.Packet):
         __hdr_defaults__ = {
             'withdrawn': [],
             'attributes': [],
             'announced': []
         }
+
+        # Decode ASNs in AS_PATH as 4-octet values (4-octet capable
+        # session, RFC 6793). AS4_PATH is always decoded as 4-octet
+        # regardless of this flag.
+        as4 = False
 
         def unpack(self, buf):
             self.data = buf
@@ -247,7 +269,8 @@ class BGP(dpkt.Packet):
             self.data = self.data[2:]
             l_ = []
             while plen > 0:
-                attr = self.Attribute(self.data)
+                attr = self.Attribute(as4=self.as4)
+                attr.unpack(self.data)
                 self.data = self.data[len(attr):]
                 plen -= len(attr)
                 l_.append(attr)
@@ -276,11 +299,92 @@ class BGP(dpkt.Packet):
                 b''.join(map(bytes, self.attributes)) + \
                 b''.join(map(bytes, self.announced))
 
+        def find_attribute(self, attr_type):
+            """Return the first path attribute of the given type, or None.
+
+            Duplicate attributes are preserved in self.attributes; only the
+            first occurrence is used for the derived views below.
+            """
+            for attr in self.attributes:
+                if attr.type == attr_type:
+                    return attr
+            return None
+
+        @property
+        def as_path(self):
+            """ASPath of the first AS_PATH attribute (raw view), or None."""
+            attr = self.find_attribute(AS_PATH)
+            if attr is None:
+                return None
+            return attr.as_path
+
+        @property
+        def as4_path(self):
+            """ASPath of the first AS4_PATH attribute (raw view), or None."""
+            attr = self.find_attribute(AS4_PATH)
+            if attr is None:
+                return None
+            return attr.as4_path
+
+        @property
+        def effective_as_path(self):
+            """AS path with AS4_PATH merged in per RFC 6793, Section 4.2.3.
+
+            AS_TRANS placeholders are resolved to their real 4-octet ASNs
+            for analysis. This is a derived view; the raw attributes are
+            left untouched, so an unmodified UPDATE still packs back to
+            its original encoding.
+            """
+            as_path = self.as_path
+            if as_path is None:
+                return None
+            as4_path = self.as4_path
+            if as4_path is None:
+                return as_path
+            return merge_as_paths(as_path, as4_path)
+
+        @property
+        def aggregator(self):
+            """Aggregator of the first AGGREGATOR attribute, or None."""
+            attr = self.find_attribute(AGGREGATOR)
+            if attr is None:
+                return None
+            return attr.aggregator
+
+        @property
+        def as4_aggregator(self):
+            """Aggregator4 of the first AS4_AGGREGATOR attribute, or None."""
+            attr = self.find_attribute(AS4_AGGREGATOR)
+            if attr is None:
+                return None
+            return attr.as4_aggregator
+
+        @property
+        def effective_aggregator(self):
+            """Aggregator view paired per RFC 6793.
+
+            When AGGREGATOR carries the AS_TRANS placeholder and an
+            AS4_AGGREGATOR attribute is present, the latter holds the
+            real 4-octet ASN; otherwise AGGREGATOR is authoritative.
+            """
+            aggregator = self.aggregator
+            if aggregator is None:
+                return None
+            if aggregator.asn == AS_TRANS:
+                as4_aggregator = self.as4_aggregator
+                if as4_aggregator is not None:
+                    return as4_aggregator
+            return aggregator
+
         class Attribute(dpkt.Packet):
             __hdr__ = (
                 ('flags', 'B', 0),
                 ('type', 'B', 0)
             )
+
+            # Decode ASNs in AS_PATH as 4-octet values (set from the
+            # session capability, never guessed from the length).
+            as4 = False
 
             @property
             def optional(self):
@@ -329,7 +433,13 @@ class BGP(dpkt.Packet):
                 if self.type == ORIGIN:
                     self.data = self.origin = self.Origin(self.data)
                 elif self.type == AS_PATH:
-                    self.data = self.as_path = self.ASPath(self.data)
+                    as_path = self.ASPath(as4=self.as4)
+                    as_path.unpack(self.data)
+                    self.data = self.as_path = as_path
+                elif self.type == AS4_PATH:
+                    as4_path = self.ASPath(as4=True)
+                    as4_path.unpack(self.data)
+                    self.data = self.as4_path = as4_path
                 elif self.type == NEXT_HOP:
                     self.data = self.next_hop = self.NextHop(self.data)
                 elif self.type == MULTI_EXIT_DISC:
@@ -340,6 +450,8 @@ class BGP(dpkt.Packet):
                     self.data = self.atomic_aggregate = self.AtomicAggregate(self.data)
                 elif self.type == AGGREGATOR:
                     self.data = self.aggregator = self.Aggregator(self.data)
+                elif self.type == AS4_AGGREGATOR:
+                    self.data = self.as4_aggregator = self.Aggregator4(self.data)
                 elif self.type == COMMUNITIES:
                     self.data = self.communities = self.Communities(self.data)
                 elif self.type == ORIGINATOR_ID:
@@ -375,15 +487,20 @@ class BGP(dpkt.Packet):
                     'segments': []
                 }
 
+                # ASN width of the segments: 4-octet when the session
+                # negotiated the AS4 capability or when parsing AS4_PATH,
+                # 2-octet otherwise. Never inferred from the data length.
+                as4 = False
+
                 def unpack(self, buf):
                     self.data = buf
                     l_ = []
-                    as4 = len(self.data) == 6
+                    if self.as4:
+                        segment_cls = self.ASPathSegment4
+                    else:
+                        segment_cls = self.ASPathSegment
                     while self.data:
-                        if as4:
-                            seg = self.ASPathSegment4(self.data)
-                        else:
-                            seg = self.ASPathSegment(self.data)
+                        seg = segment_cls(self.data)
                         self.data = self.data[len(seg):]
                         l_.append(seg)
                     self.data = self.segments = l_
@@ -471,6 +588,13 @@ class BGP(dpkt.Packet):
             class Aggregator(dpkt.Packet):
                 __hdr__ = (
                     ('asn', 'H', 0),
+                    ('ip', 'I', 0)
+                )
+
+            class Aggregator4(dpkt.Packet):
+                # AS4_AGGREGATOR attribute - RFC 6793
+                __hdr__ = (
+                    ('asn', 'I', 0),
                     ('ip', 'I', 0)
                 )
 
@@ -670,6 +794,66 @@ class BGP(dpkt.Packet):
             ('rsvd', 'B', 0),
             ('safi', 'B', SAFI_UNICAST)
         )
+
+
+def _counted_asns(segments):
+    """Count AS numbers per the path-length rules used by RFC 6793.
+
+    Each AS in an AS_SEQUENCE counts as one, an AS_SET counts as one
+    regardless of its size, and AS_CONFED_* segments are not counted.
+    """
+    count = 0
+    for segment in segments:
+        if segment.type == AS_SEQUENCE:
+            count += len(segment.path)
+        elif segment.type == AS_SET:
+            count += 1
+    return count
+
+
+def merge_as_paths(as_path, as4_path):
+    """Merge an AS_PATH with its AS4_PATH companion per RFC 6793, Sec. 4.2.3.
+
+    Returns an ASPath view for analysis; the inputs are never modified.
+    Segment boundaries (AS_SEQUENCE, AS_SET and confederation segments)
+    are preserved. If AS4_PATH is not shorter than AS_PATH it carries no
+    additional information and is ignored, per the RFC.
+    """
+    ASPath = BGP.Update.Attribute.ASPath
+
+    as_path_count = _counted_asns(as_path.segments)
+    as4_path_count = _counted_asns(as4_path.segments)
+    if as4_path_count >= as_path_count:
+        return as_path
+
+    def clone_segment(segment, path=None):
+        clone = ASPath.ASPathSegment4()
+        clone.type = segment.type
+        clone.path = list(segment.path if path is None else path)
+        clone.len = len(clone.path)
+        return clone
+
+    # Prepend the leading ASes of AS_PATH that AS4_PATH does not cover.
+    prefix_count = as_path_count - as4_path_count
+    segments = []
+    for segment in as_path.segments:
+        if prefix_count <= 0:
+            break
+        if segment.type == AS_SEQUENCE:
+            take = min(prefix_count, len(segment.path))
+            segments.append(clone_segment(segment, segment.path[:take]))
+            prefix_count -= take
+        elif segment.type == AS_SET:
+            segments.append(clone_segment(segment))
+            prefix_count -= 1
+        else:
+            # Confederation segments are not counted towards the length.
+            segments.append(clone_segment(segment))
+    segments.extend(clone_segment(segment) for segment in as4_path.segments)
+
+    merged = ASPath(as4=True)
+    merged.data = merged.segments = segments
+    return merged
 
 
 class RouteGeneric(dpkt.Packet):
@@ -1117,13 +1301,16 @@ def test_bgp_add_path_6_1_as_path():
     # test for https://github.com/kbandla/dpkt/issues/481
     # Error processing BGP data: packet 6 : message 1 of bgp-add-path.cap
     # https://packetlife.net/media/captures/bgp-add-path.cap
+    # the session negotiated the 4-octet ASN capability, so AS_PATH is
+    # decoded with 4-octet ASNs explicitly (not guessed from its length)
     __bgp = (
         b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x59\x02\x00\x00\x00\x30\x40\x01'
         b'\x01\x00\x40\x02\x06\x02\x01\x00\x00\xfb\xff\x40\x03\x04\x0a\x00\x0e\x01\x80\x04\x04\x00\x00\x00\x00'
         b'\x40\x05\x04\x00\x00\x00\x64\x80\x0a\x04\x0a\x00\x22\x04\x80\x09\x04\x0a\x00\x0f\x01\x00\x00\x00\x01'
         b'\x20\x05\x05\x05\x05\x00\x00\x00\x01\x20\xc0\xa8\x01\x05'
     )
-    bgp = BGP(__bgp)
+    bgp = BGP(as4=True)
+    bgp.unpack(__bgp)
     assert (__bgp == bytes(bgp))
     assert (len(bgp) == 89)
     assert (bgp.type == UPDATE)
@@ -1583,3 +1770,224 @@ def test_reservedcommunities():
 
     assert len(communities) == 4
     assert bytes(communities) == buf
+
+
+def _attr_buf(flags, attr_type, payload):
+    return struct.pack('>BB', flags, attr_type) + struct.pack('>B', len(payload)) + payload
+
+
+def _as_path_buf(segments):
+    # segments: list of (segment_type, [asn, ...]) with 2-octet ASNs
+    out = b''
+    for seg_type, asns in segments:
+        out += struct.pack('>BB', seg_type, len(asns))
+        out += b''.join(struct.pack('>H', asn) for asn in asns)
+    return out
+
+
+def _as4_path_buf(segments):
+    # segments: list of (segment_type, [asn, ...]) with 4-octet ASNs
+    out = b''
+    for seg_type, asns in segments:
+        out += struct.pack('>BB', seg_type, len(asns))
+        out += b''.join(struct.pack('>I', asn) for asn in asns)
+    return out
+
+
+def _bgp_update_buf(attributes):
+    update = struct.pack('>H', 0) + struct.pack('>H', len(attributes)) + attributes
+    return b'\xff' * 16 + struct.pack('>HB', 19 + len(update), UPDATE) + update
+
+
+def test_as4_path_merge_multiple_as_trans():
+    # AS_PATH seen at a legacy (2-octet) speaker holds AS_TRANS placeholders
+    as_path = _attr_buf(0x40, AS_PATH, _as_path_buf([
+        (AS_SEQUENCE, [65001, AS_TRANS, AS_TRANS]),
+    ]))
+    as4_path = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [65551, 196611]),
+    ]))
+    buf = _bgp_update_buf(as_path + as4_path)
+
+    bgp = BGP(buf)
+    # the unmodified UPDATE round-trips to its original encoding
+    assert bytes(bgp) == buf
+
+    update = bgp.update
+    # raw views keep the original attributes, AS_TRANS included
+    assert update.as_path.segments[0].type == AS_SEQUENCE
+    assert update.as_path.segments[0].path == [65001, AS_TRANS, AS_TRANS]
+    assert update.as4_path.segments[0].path == [65551, 196611]
+
+    # effective view: 3 counted ASes in AS_PATH, 2 in AS4_PATH,
+    # so the first AS of AS_PATH is prepended to AS4_PATH
+    effective = update.effective_as_path
+    assert [(s.type, s.path) for s in effective.segments] == [
+        (AS_SEQUENCE, [65001]),
+        (AS_SEQUENCE, [65551, 196611]),
+    ]
+    # the merged view is uniformly 4-octet encodable
+    for segment in effective.segments:
+        assert isinstance(segment, BGP.Update.Attribute.ASPath.ASPathSegment4)
+    # building the view did not normalize the raw attributes
+    assert update.as_path.segments[0].path == [65001, AS_TRANS, AS_TRANS]
+    assert bytes(bgp) == buf
+
+
+def test_as4_path_merge_sets_and_confed():
+    as_path = _attr_buf(0x40, AS_PATH, _as_path_buf([
+        (AS_CONFED_SEQUENCE, [65010]),
+        (AS_SET, [65002, 65003]),
+        (AS_SEQUENCE, [65001, AS_TRANS]),
+    ]))
+    as4_path = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [131072]),
+    ]))
+    buf = _bgp_update_buf(as_path + as4_path)
+
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+
+    # path count: confed segments count 0, the AS_SET counts 1 and the
+    # sequence counts 2 -> 3 counted ASes; AS4_PATH covers 1, so the
+    # prefix keeps 2 counted ASes with segment boundaries preserved
+    effective = bgp.update.effective_as_path
+    assert [(s.type, s.path) for s in effective.segments] == [
+        (AS_CONFED_SEQUENCE, [65010]),
+        (AS_SET, [65002, 65003]),
+        (AS_SEQUENCE, [65001]),
+        (AS_SEQUENCE, [131072]),
+    ]
+    assert bytes(bgp) == buf
+
+
+def test_as4_path_not_shorter_is_ignored():
+    as_path = _attr_buf(0x40, AS_PATH, _as_path_buf([
+        (AS_SEQUENCE, [65001, AS_TRANS]),
+    ]))
+
+    # AS4_PATH longer than AS_PATH must not override it
+    as4_longer = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [131072, 131073, 131074]),
+    ]))
+    buf = _bgp_update_buf(as_path + as4_longer)
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    assert bgp.update.effective_as_path is bgp.update.as_path
+    assert bgp.update.effective_as_path.segments[0].path == [65001, AS_TRANS]
+
+    # same length carries no extra information either
+    as4_equal = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [131072, 131073]),
+    ]))
+    buf = _bgp_update_buf(as_path + as4_equal)
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    assert bgp.update.effective_as_path is bgp.update.as_path
+
+    # and without AS4_PATH the effective view is the raw AS_PATH
+    buf = _bgp_update_buf(as_path)
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    assert bgp.update.as4_path is None
+    assert bgp.update.effective_as_path is bgp.update.as_path
+
+
+def test_as4_aggregator_pairing():
+    aggregator = _attr_buf(0xc0, AGGREGATOR, struct.pack('>HI', AS_TRANS, 0x0a000001))
+    as4_aggregator = _attr_buf(0xc0, AS4_AGGREGATOR, struct.pack('>II', 131072, 0x0a000001))
+    buf = _bgp_update_buf(aggregator + as4_aggregator)
+
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+
+    update = bgp.update
+    assert update.aggregator.asn == AS_TRANS
+    assert update.as4_aggregator.asn == 131072
+    # AS_TRANS in AGGREGATOR defers to AS4_AGGREGATOR
+    effective = update.effective_aggregator
+    assert effective.asn == 131072
+    assert effective.ip == 0x0a000001
+
+    # a real 2-octet ASN in AGGREGATOR stays authoritative
+    aggregator2 = _attr_buf(0xc0, AGGREGATOR, struct.pack('>HI', 65001, 0x0a000002))
+    buf = _bgp_update_buf(aggregator2 + as4_aggregator)
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    assert bgp.update.effective_aggregator.asn == 65001
+
+
+def test_as4_duplicate_attributes():
+    as_path = _attr_buf(0x40, AS_PATH, _as_path_buf([
+        (AS_SEQUENCE, [65001, AS_TRANS]),
+    ]))
+    as4_first = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [131072]),
+    ]))
+    as4_second = _attr_buf(0xc0, AS4_PATH, _as4_path_buf([
+        (AS_SEQUENCE, [999999]),
+    ]))
+    buf = _bgp_update_buf(as_path + as4_first + as4_second)
+
+    bgp = BGP(buf)
+    # duplicates are preserved verbatim on the wire
+    assert bytes(bgp) == buf
+
+    update = bgp.update
+    assert len([a for a in update.attributes if a.type == AS4_PATH]) == 2
+    # the first occurrence wins for the derived views
+    assert update.as4_path.segments[0].path == [131072]
+    effective = update.effective_as_path
+    assert [(s.type, s.path) for s in effective.segments] == [
+        (AS_SEQUENCE, [65001]),
+        (AS_SEQUENCE, [131072]),
+    ]
+
+
+def test_as_path_width_explicit_not_guessed():
+    # a 6-octet AS_PATH is decoded as 2-octet ASNs by default
+    payload = _as_path_buf([(AS_SEQUENCE, [500, 500])])
+    assert len(payload) == 6
+    buf = _bgp_update_buf(_attr_buf(0x40, AS_PATH, payload))
+    bgp = BGP(buf)
+    assert bytes(bgp) == buf
+    segment = bgp.update.as_path.segments[0]
+    assert segment.type == AS_SEQUENCE
+    assert segment.path == [500, 500]
+
+    # the same length on a 4-octet capable session decodes as one ASN
+    payload4 = _as4_path_buf([(AS_SEQUENCE, [65551])])
+    assert len(payload4) == 6
+    buf = _bgp_update_buf(_attr_buf(0x40, AS_PATH, payload4))
+    bgp = BGP(as4=True)
+    bgp.unpack(buf)
+    assert bytes(bgp) == buf
+    segment = bgp.update.as_path.segments[0]
+    assert segment.type == AS_SEQUENCE
+    assert segment.path == [65551]
+
+
+def test_open_cap_as4():
+    from binascii import unhexlify
+    buf = unhexlify(
+        '04'        # v
+        '5ba0'      # asn (AS_TRANS)
+        '00b4'      # holdtime
+        '0a000001'  # identifier
+        '08'        # param_len
+
+        # Parameter
+        '02'  # type (CAPABILITY)
+        '06'  # len
+
+        # Capability
+        '41'        # code (CAP_AS4)
+        '04'        # len
+        '00020000'  # asn 131072
+    )
+    bgp_open = BGP.Open(buf)
+    assert bytes(bgp_open) == buf
+
+    capability = bgp_open.parameters[0].capability
+    assert capability.code == CAP_AS4
+    assert capability.asn == 131072
