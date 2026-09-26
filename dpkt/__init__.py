@@ -19,6 +19,7 @@ from . import asn1
 from . import bgp
 from . import cdp
 from . import dhcp
+from . import dhcp6
 from . import diameter
 from . import dns
 from . import dtp

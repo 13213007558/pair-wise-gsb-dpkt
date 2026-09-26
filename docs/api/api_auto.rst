@@ -87,6 +87,14 @@ dpkt.dhcp module
     :undoc-members:
     :show-inheritance:
 
+dpkt.dhcp6 module
+-----------------
+
+.. automodule:: dpkt.dhcp6
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.diameter module
 --------------------
 
@@ -534,4 +542,3 @@ dpkt.yahoo module
     :members:
     :undoc-members:
     :show-inheritance:
-
