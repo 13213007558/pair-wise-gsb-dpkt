@@ -261,7 +261,335 @@ class Netflow7(NetflowBase):
         )
 
 
-# No support for v8 or v9 yet.
+# No support for v8 yet.
+
+
+# Netflow Version 9 (RFC 3954).
+#
+# Unlike the fixed-layout versions above, v9 is template based: Template
+# FlowSets carried in the export stream describe the layout of subsequent
+# Data FlowSets. Decoding a stream therefore requires state, which lives in
+# Netflow9Decoder. Templates are scoped by the caller-supplied exporter
+# identity together with the Source ID and Template ID from the packet, so
+# templates from different exporters never collide even when they reuse the
+# same Template ID.
+
+NETFLOW9_TEMPLATE_FLOWSET_ID = 0
+NETFLOW9_OPTIONS_TEMPLATE_FLOWSET_ID = 1
+NETFLOW9_MIN_TEMPLATE_ID = 256
+
+
+class Netflow9(dpkt.Packet):
+    """Netflow Version 9 export packet header (RFC 3954).
+
+    Only the header is parsed; the FlowSet payload is left in .data because
+    interpreting it requires template state. Feed the whole packet buffer to
+    Netflow9Decoder.process_packet() to get the header plus decoded FlowSets.
+
+    Attributes:
+        __hdr__: Header fields of Netflow Version 9.
+    """
+
+    __hdr__ = (
+        ('version', 'H', 9),
+        ('count', 'H', 0),
+        ('sys_uptime', 'I', 0),
+        ('unix_sec', 'I', 0),
+        ('sequence_number', 'I', 0),
+        ('source_id', 'I', 0),
+    )
+
+
+class Netflow9Template(object):
+    """A Netflow v9 Template (or Options Template) learned from a Template FlowSet.
+
+    Attributes:
+        template_id: Template ID assigned by the exporter (>= 256).
+        fields: Ordered list of (field_type, field_length) tuples covering
+            both scope and option/regular fields.
+        scope_field_count: Number of leading scope fields; 0 for plain
+            templates, > 0 for Options Templates.
+    """
+
+    __slots__ = ('template_id', 'fields', 'scope_field_count')
+
+    def __init__(self, template_id, fields, scope_field_count=0):
+        self.template_id = template_id
+        self.fields = list(fields)
+        self.scope_field_count = scope_field_count
+
+    @property
+    def is_options(self):
+        return self.scope_field_count > 0
+
+    @property
+    def record_length(self):
+        return sum(field_length for _, field_length in self.fields)
+
+    def __repr__(self):
+        return 'Netflow9Template(template_id=%d, fields=%r, scope_field_count=%d)' % (
+            self.template_id, self.fields, self.scope_field_count)
+
+
+class Netflow9Field(object):
+    """A single decoded field of a Netflow v9 data record.
+
+    The raw bytes are always kept so that field types unknown to the
+    collector survive the round trip with their type number intact.
+
+    Attributes:
+        type: Field type number as assigned by the exporter.
+        data: Raw field bytes.
+    """
+
+    __slots__ = ('type', 'data')
+
+    def __init__(self, field_type, data):
+        self.type = field_type
+        self.data = data
+
+    @property
+    def length(self):
+        return len(self.data)
+
+    @property
+    def value(self):
+        """Integer value for 1/2/4/8-byte fields, raw bytes otherwise."""
+        fmt = {1: '>B', 2: '>H', 4: '>I', 8: '>Q'}.get(len(self.data))
+        if fmt is None:
+            return self.data
+        return struct.unpack(fmt, self.data)[0]
+
+    def __repr__(self):
+        return 'Netflow9Field(type=%d, data=%r)' % (self.type, self.data)
+
+
+class Netflow9TemplateFlowSet(object):
+    """Decoded Template FlowSet; its templates are already registered."""
+
+    flowset_id = NETFLOW9_TEMPLATE_FLOWSET_ID
+    pending = False
+
+    def __init__(self, templates):
+        self.templates = templates
+
+
+class Netflow9OptionsTemplateFlowSet(object):
+    """Decoded Options Template FlowSet; its templates are already registered."""
+
+    flowset_id = NETFLOW9_OPTIONS_TEMPLATE_FLOWSET_ID
+    pending = False
+
+    def __init__(self, templates):
+        self.templates = templates
+
+
+class Netflow9DataFlowSet(object):
+    """Data FlowSet decoded against a known template.
+
+    Attributes:
+        flowset_id: FlowSet (== Template) ID.
+        template: The Netflow9Template used for decoding.
+        records: List of records; each record is a list of Netflow9Field
+            following the template field order (scope fields first for
+            Options Templates).
+    """
+
+    pending = False
+
+    def __init__(self, template, records):
+        self.flowset_id = template.template_id
+        self.template = template
+        self.records = records
+
+
+class Netflow9UnknownFlowSet(object):
+    """FlowSet that could not be interpreted yet.
+
+    Produced for Data FlowSets whose template has not been seen (for this
+    exporter/Source ID) and for reserved FlowSet IDs. The raw payload is
+    preserved so the caller can decode it later via
+    Netflow9Decoder.decode_pending() once the template arrives.
+
+    Attributes:
+        flowset_id: FlowSet ID from the packet.
+        data: Raw FlowSet payload (without the FlowSet header).
+    """
+
+    pending = True
+
+    def __init__(self, flowset_id, data):
+        self.flowset_id = flowset_id
+        self.data = data
+
+
+def _decode_netflow9_records(template, buf):
+    """Split a Data FlowSet payload into records per the template.
+
+    Trailing bytes shorter than one record are 32-bit alignment padding and
+    are not returned as a record.
+    """
+    records = []
+    record_length = template.record_length
+    if record_length == 0:
+        return records
+    offset = 0
+    while offset + record_length <= len(buf):
+        record = []
+        for field_type, field_length in template.fields:
+            record.append(Netflow9Field(field_type, buf[offset:offset + field_length]))
+            offset += field_length
+        records.append(record)
+    return records
+
+
+class Netflow9Decoder(object):
+    """Stateful decoder for a stream of Netflow v9 export packets.
+
+    Templates learned from Template FlowSets are remembered per
+    (exporter, source_id, template_id) and applied to subsequent Data
+    FlowSets. Redefining a Template ID only affects packets processed after
+    the redefinition. Sequence numbers are tracked per (exporter, source_id)
+    for informational purposes; an out-of-order packet never clears template
+    state on its own -- use exporter_restarted() or expire_templates() for
+    explicit lifecycle management.
+    """
+
+    def __init__(self):
+        self.templates = {}
+        self.last_sequence = {}
+
+    def process_packet(self, buf, exporter=None):
+        """Process one export packet.
+
+        Args:
+            buf: Raw bytes of one Netflow v9 export packet.
+            exporter: Caller-supplied identity of the exporting device (e.g.
+                its source address). Templates are scoped by this identity so
+                distinct exporters may reuse the same Template IDs.
+
+        Returns:
+            The parsed Netflow9 header with a .flowsets list containing
+            Netflow9TemplateFlowSet, Netflow9OptionsTemplateFlowSet,
+            Netflow9DataFlowSet and Netflow9UnknownFlowSet objects, and an
+            .out_of_order flag noting sequence number regressions.
+        """
+        pkt = Netflow9(buf)
+        if pkt.version != 9:
+            raise dpkt.UnpackError('expected Netflow v9, got version %d' % pkt.version)
+        domain = (exporter, pkt.source_id)
+        last = self.last_sequence.get(domain)
+        pkt.out_of_order = last is not None and pkt.sequence_number <= last
+        if last is None or pkt.sequence_number > last:
+            self.last_sequence[domain] = pkt.sequence_number
+        pkt.flowsets = self._parse_flowsets(domain, pkt.data)
+        return pkt
+
+    def decode_pending(self, flowset, exporter=None, source_id=0):
+        """Decode a previously returned Netflow9UnknownFlowSet.
+
+        Looks up the template registered since the FlowSet was first seen
+        and returns a Netflow9DataFlowSet. Raises KeyError if the template
+        is still unknown.
+        """
+        template = self.templates[(exporter, source_id, flowset.flowset_id)]
+        return Netflow9DataFlowSet(template, _decode_netflow9_records(template, flowset.data))
+
+    def exporter_restarted(self, exporter=None, source_id=None):
+        """Declare that an exporter restarted; drop its template state.
+
+        With source_id=None all sources of the exporter are affected.
+        """
+        self._purge(exporter=exporter, source_id=source_id, drop_sequence=True)
+
+    def expire_templates(self, exporter=None, source_id=None, template_id=None):
+        """Expire matching templates; with no arguments, expire all of them."""
+        self._purge(exporter=exporter, source_id=source_id, template_id=template_id)
+
+    def _purge(self, exporter=None, source_id=None, template_id=None, drop_sequence=False):
+        for key in list(self.templates):
+            exp, src, tid = key
+            if exporter is not None and exp != exporter:
+                continue
+            if source_id is not None and src != source_id:
+                continue
+            if template_id is not None and tid != template_id:
+                continue
+            del self.templates[key]
+        if drop_sequence:
+            for key in list(self.last_sequence):
+                exp, src = key
+                if exporter is not None and exp != exporter:
+                    continue
+                if source_id is not None and src != source_id:
+                    continue
+                del self.last_sequence[key]
+
+    def _parse_flowsets(self, domain, buf):
+        flowsets = []
+        while len(buf) >= 4:
+            flowset_id, length = struct.unpack('>HH', buf[:4])
+            if length < 4:
+                raise dpkt.UnpackError('invalid Netflow v9 FlowSet length %d' % length)
+            if len(buf) < length:
+                raise dpkt.NeedData('truncated Netflow v9 FlowSet: got %d, need %d' % (len(buf), length))
+            body = buf[4:length]
+            buf = buf[length:]
+            if flowset_id == NETFLOW9_TEMPLATE_FLOWSET_ID:
+                flowsets.append(Netflow9TemplateFlowSet(self._parse_templates(domain, body, options=False)))
+            elif flowset_id == NETFLOW9_OPTIONS_TEMPLATE_FLOWSET_ID:
+                flowsets.append(Netflow9OptionsTemplateFlowSet(self._parse_templates(domain, body, options=True)))
+            elif flowset_id >= NETFLOW9_MIN_TEMPLATE_ID:
+                template = self.templates.get((domain[0], domain[1], flowset_id))
+                if template is None:
+                    flowsets.append(Netflow9UnknownFlowSet(flowset_id, body))
+                else:
+                    flowsets.append(Netflow9DataFlowSet(template, _decode_netflow9_records(template, body)))
+            else:
+                # Reserved FlowSet ID; keep the raw payload.
+                flowsets.append(Netflow9UnknownFlowSet(flowset_id, body))
+        # Any remaining < 4 bytes are alignment padding.
+        return flowsets
+
+    def _parse_templates(self, domain, buf, options):
+        templates = []
+        offset = 0
+        while offset + 4 <= len(buf):
+            if options:
+                template, offset = self._parse_options_template(buf, offset)
+            else:
+                template, offset = self._parse_template(buf, offset)
+            self.templates[(domain[0], domain[1], template.template_id)] = template
+            templates.append(template)
+        return templates
+
+    @staticmethod
+    def _parse_template(buf, offset):
+        template_id, field_count = struct.unpack_from('>HH', buf, offset)
+        offset += 4
+        if offset + field_count * 4 > len(buf):
+            raise dpkt.NeedData('truncated Netflow v9 Template record')
+        fields = []
+        for _ in range(field_count):
+            fields.append(struct.unpack_from('>HH', buf, offset))
+            offset += 4
+        return Netflow9Template(template_id, fields), offset
+
+    @staticmethod
+    def _parse_options_template(buf, offset):
+        template_id, scope_length, option_length = struct.unpack_from('>HHH', buf, offset)
+        offset += 6
+        if offset + scope_length + option_length > len(buf):
+            raise dpkt.NeedData('truncated Netflow v9 Options Template record')
+        fields = []
+        for end in (offset + scope_length, offset + scope_length + option_length):
+            while offset < end:
+                fields.append(struct.unpack_from('>HH', buf, offset))
+                offset += 4
+        scope_field_count = scope_length // 4
+        # Options Template records are padded to a 32-bit boundary.
+        offset = (offset + 3) & ~3
+        return Netflow9Template(template_id, fields, scope_field_count), offset
 def test_net_flow_v1_unpack():
     from binascii import unhexlify
     __sample_v1 = unhexlify(
@@ -343,3 +671,189 @@ def test_net_flow_v5_unpack():
     for idx, record in enumerate(nf.data):
         assert bytes(record) == buf_nf5_records[idx]
         assert len(record) == 48
+
+
+def _v9_export_packet(flowsets, sequence_number=0, source_id=0):
+    body = b''.join(flowsets)
+    return struct.pack('>HHIIII', 9, 0, 0, 0, sequence_number, source_id) + body
+
+
+def _v9_template_flowset(templates):
+    body = b''
+    for template_id, fields in templates:
+        body += struct.pack('>HH', template_id, len(fields))
+        for field_type, field_length in fields:
+            body += struct.pack('>HH', field_type, field_length)
+    return struct.pack('>HH', NETFLOW9_TEMPLATE_FLOWSET_ID, 4 + len(body)) + body
+
+
+def _v9_options_template_flowset(template_id, scope_fields, option_fields):
+    body = struct.pack('>HHH', template_id, 4 * len(scope_fields), 4 * len(option_fields))
+    for field_type, field_length in scope_fields + option_fields:
+        body += struct.pack('>HH', field_type, field_length)
+    if len(body) % 4:
+        body += b'\x00' * (4 - len(body) % 4)
+    return struct.pack('>HH', NETFLOW9_OPTIONS_TEMPLATE_FLOWSET_ID, 4 + len(body)) + body
+
+
+def _v9_data_flowset(template_id, records, pad=True):
+    body = b''.join(records)
+    if pad and len(body) % 4:
+        body += b'\x00' * (4 - len(body) % 4)
+    return struct.pack('>HH', template_id, 4 + len(body)) + body
+
+
+def test_netflow9_template_then_data():
+    decoder = Netflow9Decoder()
+    fields = [(8, 4), (12, 4), (7, 2), (11, 2), (4, 1)]  # srcaddr, dstaddr, srcport, dstport, prot
+    pkt = decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, fields)])]), exporter='exp1')
+    assert pkt.version == 9
+    assert isinstance(pkt.flowsets[0], Netflow9TemplateFlowSet)
+    template = pkt.flowsets[0].templates[0]
+    assert template.template_id == 256
+    assert template.record_length == 13
+    assert not template.is_options
+
+    record1 = struct.pack('>IIHHB', 0x0a000001, 0x0a000002, 1234, 80, 6)
+    record2 = struct.pack('>IIHHB', 0x0a000003, 0x0a000004, 4321, 443, 17)
+    pkt = decoder.process_packet(
+        _v9_export_packet([_v9_data_flowset(256, [record1, record2])], sequence_number=2), exporter='exp1')
+    flowset = pkt.flowsets[0]
+    assert isinstance(flowset, Netflow9DataFlowSet)
+    assert not flowset.pending
+    # 2 records of 13 bytes = 26, padded to 28; padding must not become a record
+    assert len(flowset.records) == 2
+    values = [[field.value for field in record] for record in flowset.records]
+    assert values[0] == [0x0a000001, 0x0a000002, 1234, 80, 6]
+    assert values[1] == [0x0a000003, 0x0a000004, 4321, 443, 17]
+
+
+def test_netflow9_unknown_template_kept_raw():
+    decoder = Netflow9Decoder()
+    raw_record = struct.pack('>IH', 0xdeadbeef, 7)
+    pkt = decoder.process_packet(_v9_export_packet([_v9_data_flowset(300, [raw_record], pad=False)]))
+    flowset = pkt.flowsets[0]
+    assert isinstance(flowset, Netflow9UnknownFlowSet)
+    assert flowset.pending
+    assert flowset.flowset_id == 300
+    assert flowset.data == raw_record
+
+    # Once the template arrives, the pending FlowSet can be interpreted.
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(300, [(8, 4), (7, 2)])])]))
+    decoded = decoder.decode_pending(flowset)
+    assert isinstance(decoded, Netflow9DataFlowSet)
+    assert [[f.value for f in r] for r in decoded.records] == [[0xdeadbeef, 7]]
+
+
+def test_netflow9_templates_scoped_per_exporter():
+    decoder = Netflow9Decoder()
+    # Both exporters reuse Template ID 256 with different layouts.
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])]), exporter='expA')
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(7, 2), (11, 2)])])]), exporter='expB')
+
+    record_a = struct.pack('>I', 0xc0a80101)
+    record_b = struct.pack('>HH', 1024, 2048)
+    pkt_a = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [record_a])], 1), exporter='expA')
+    pkt_b = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [record_b])], 1), exporter='expB')
+    pkt_a2 = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [record_a])], 2), exporter='expA')
+
+    assert [f.value for f in pkt_a.flowsets[0].records[0]] == [0xc0a80101]
+    assert [f.value for f in pkt_b.flowsets[0].records[0]] == [1024, 2048]
+    assert [f.value for f in pkt_a2.flowsets[0].records[0]] == [0xc0a80101]
+
+    # A third exporter with the same Template ID must not borrow either template.
+    pkt_c = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [record_a])]), exporter='expC')
+    assert isinstance(pkt_c.flowsets[0], Netflow9UnknownFlowSet)
+
+
+def test_netflow9_template_scoped_per_source_id():
+    decoder = Netflow9Decoder()
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])], source_id=1), exporter='exp')
+    pkt = decoder.process_packet(
+        _v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 1)], pad=False)], source_id=2), exporter='exp')
+    assert isinstance(pkt.flowsets[0], Netflow9UnknownFlowSet)
+
+
+def test_netflow9_template_redefinition_affects_only_later_data():
+    decoder = Netflow9Decoder()
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])]))
+    pkt = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 42)], pad=False)]))
+    assert [f.value for f in pkt.flowsets[0].records[0]] == [42]
+
+    # Redefine the same Template ID; only subsequent data uses the new layout.
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(7, 2), (11, 2)])])]))
+    pkt = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [struct.pack('>HH', 1, 2)], pad=False)]))
+    assert [f.value for f in pkt.flowsets[0].records[0]] == [1, 2]
+
+
+def test_netflow9_options_template():
+    decoder = Netflow9Decoder()
+    scope_fields = [(2, 4)]  # scope: interface
+    option_fields = [(34, 4), (35, 2)]  # sampling algorithm, interval-ish
+    decoder.process_packet(_v9_export_packet(
+        [_v9_options_template_flowset(257, scope_fields, option_fields)]))
+    template = decoder.templates[(None, 0, 257)]
+    assert template.is_options
+    assert template.scope_field_count == 1
+
+    record = struct.pack('>IIH', 5, 1, 100)
+    pkt = decoder.process_packet(_v9_export_packet([_v9_data_flowset(257, [record], pad=False)]))
+    flowset = pkt.flowsets[0]
+    assert isinstance(flowset, Netflow9DataFlowSet)
+    assert [f.value for f in flowset.records[0]] == [5, 1, 100]
+    assert [f.type for f in flowset.records[0]] == [2, 34, 35]
+
+
+def test_netflow9_unknown_field_type_preserved():
+    decoder = Netflow9Decoder()
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4), (65000, 3)])])]))
+    record = struct.pack('>I', 9) + b'\x01\x02\x03'
+    pkt = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [record], pad=False)]))
+    fields = pkt.flowsets[0].records[0]
+    assert fields[1].type == 65000
+    assert fields[1].data == b'\x01\x02\x03'
+    assert fields[1].value == b'\x01\x02\x03'  # not an integer length
+
+
+def test_netflow9_exporter_restart_and_expiry():
+    decoder = Netflow9Decoder()
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])]), exporter='expA')
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])]), exporter='expB')
+
+    # Restart of expA only clears expA state.
+    decoder.exporter_restarted('expA')
+    pkt_a = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 1)], pad=False)]),
+                                   exporter='expA')
+    pkt_b = decoder.process_packet(_v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 1)], pad=False)]),
+                                   exporter='expB')
+    assert isinstance(pkt_a.flowsets[0], Netflow9UnknownFlowSet)
+    assert isinstance(pkt_b.flowsets[0], Netflow9DataFlowSet)
+
+    # Selective expiry by Template ID, then full expiry.
+    decoder.expire_templates(exporter='expB', template_id=256)
+    assert decoder.templates == {}
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])]))
+    decoder.expire_templates()
+    assert decoder.templates == {}
+
+
+def test_netflow9_out_of_order_packet_keeps_state():
+    decoder = Netflow9Decoder()
+    decoder.process_packet(_v9_export_packet([_v9_template_flowset([(256, [(8, 4)])])], sequence_number=10))
+    pkt = decoder.process_packet(
+        _v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 7)], pad=False)], sequence_number=3))
+    assert pkt.out_of_order
+    # Sequence regression alone must not wipe template state.
+    assert isinstance(pkt.flowsets[0], Netflow9DataFlowSet)
+    assert (None, 0, 256) in decoder.templates
+
+    pkt = decoder.process_packet(
+        _v9_export_packet([_v9_data_flowset(256, [struct.pack('>I', 8)], pad=False)], sequence_number=11))
+    assert not pkt.out_of_order
+
+
+def test_netflow9_rejects_other_versions():
+    import pytest
+    decoder = Netflow9Decoder()
+    with pytest.raises(dpkt.UnpackError):
+        decoder.process_packet(struct.pack('>HHIIII', 5, 0, 0, 0, 0, 0))
