@@ -14,6 +14,7 @@ from .dpkt import *
 from . import ah
 from . import aoe
 from . import aim
+from . import anonymize
 from . import arp
 from . import asn1
 from . import bgp
