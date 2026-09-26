@@ -9,6 +9,7 @@ from __future__ import division  # so python 2 doesn't do integer division
 
 from struct import pack as struct_pack, unpack as struct_unpack
 from time import time
+from collections import namedtuple
 import sys
 
 from . import dpkt
@@ -409,6 +410,57 @@ class PacketBlockLE(PacketBlock):
     __byte_order__ = '<'
 
 
+class SimplePacketBlock(_PcapngBlock):
+    """Simple Packet block.
+
+    Carries no interface id and no timestamp; it implicitly belongs to
+    interface 0 of the current section. It has no Options either.
+    """
+
+    __hdr__ = (
+        ('type', 'I', PCAPNG_BT_SPB),
+        ('len', 'I', 16),
+        ('pkt_len', 'I', 0),  # actual packet len
+        # ( pkt_data, variable size )
+        ('_len', 'I', 16)
+    )
+
+    def unpack(self, buf):
+        dpkt.Packet.unpack(self, buf)
+        if self.len > len(buf):
+            raise dpkt.NeedData
+
+        # packet data, trimmed to the original packet length
+        po = self.__hdr_len__ - 4  # offset of pkt_data
+        self.pkt_data = buf[po:self.len - 4][:self.pkt_len]
+
+        self.opts = []
+        self.data = ''
+
+        # duplicate total length field
+        self._len = struct_unpack(self.__hdr_fmt__[0] + 'I', buf[self.len - 4:self.len])[0]
+        if self._len != self.len:
+            raise dpkt.UnpackError('length fields do not match')
+
+    def __bytes__(self):
+        pkt_buf = getattr(self, 'pkt_data', b'')
+
+        self.pkt_len = len(pkt_buf)
+        n = self.__hdr_len__ + _align32b(self.pkt_len)
+        self.len = n
+        self._len = n
+
+        hdr_buf = self._pack_hdr(self.type, n, self.pkt_len, n)
+        return b''.join([hdr_buf[:-4], _padded(pkt_buf), hdr_buf[-4:]])
+
+    def __len__(self):
+        return self.__hdr_len__ + _align32b(len(getattr(self, 'pkt_data', b'')))
+
+
+class SimplePacketBlockLE(SimplePacketBlock):
+    __byte_order__ = '<'
+
+
 class Writer(object):
     """Simple pcapng dumpfile writer."""
 
@@ -556,83 +608,194 @@ class Writer(object):
         self.__f.close()
 
 
+class PcapngPacket(namedtuple('PcapngPacket', ('ts', 'data', 'section', 'iface', 'linktype'))):
+    """A single packet read from a pcapng file, with its capture context.
+
+    Fields:
+        ts       -- packet timestamp in seconds since the Epoch, computed with
+                    the resolution and offset of the interface the packet was
+                    captured on; None for Simple Packet Blocks, which carry no
+                    timestamp
+        data     -- captured packet data (bytes)
+        section  -- 0-based index of the section the packet belongs to
+        iface    -- id of the interface within its section
+        linktype -- link-layer type (DLT_*) of the interface
+    """
+    __slots__ = ()
+
+
 class Reader(object):
-    """Simple pypcap-compatible pcapng file reader."""
+    """Simple pypcap-compatible pcapng file reader.
+
+    Supports files with multiple sections (each with its own byte order) and
+    multiple interfaces per section (each with its own link type, timestamp
+    resolution and timestamp offset). Interface numbering restarts at 0 in
+    every section.
+
+    Iterating over the reader yields legacy (ts, pkt) tuples. Use
+    iter_packets() to also get the section, interface and link type of each
+    packet.
+    """
 
     def __init__(self, fileobj):
         self.name = getattr(fileobj, 'name', '<{0}>'.format(fileobj.__class__.__name__))
         self.__f = fileobj
+        self.__le = False
+        self._section = -1  # index of the current section
+        self._idbs = []     # IDBs of the current section
+        self._tsinfo = []   # (divisor, tsoffset) per interface of the current section
 
-        shb = SectionHeaderBlock()
-        buf = self.__f.read(shb.__hdr_len__)
-        if len(buf) < shb.__hdr_len__:
+        buf = self.__f.read(8)
+        if len(buf) < 8:
             raise ValueError('invalid pcapng header')
 
-        # unpack just the header since endianness is not known
-        shb.unpack_hdr(buf)
-        if shb.type != PCAPNG_BT_SHB:
+        # the SHB block type is endianness-agnostic
+        if struct_unpack('>I', buf[:4])[0] != PCAPNG_BT_SHB:
             raise ValueError('invalid pcapng header: not a SHB')
 
-        # determine the correct byte order and reload full SHB
-        if shb.bom == BYTE_ORDER_MAGIC_LE:
-            self.__le = True
-            buf += self.__f.read(_swap32b(shb.len) - shb.__hdr_len__)
-            shb = SectionHeaderBlockLE(buf)
-        elif shb.bom == BYTE_ORDER_MAGIC:
-            self.__le = False
-            buf += self.__f.read(shb.len - shb.__hdr_len__)
-            shb = SectionHeaderBlock(buf)
-        else:
-            raise ValueError('unknown endianness')
-
-        # check if this version is supported
-        if shb.v_major != PCAPNG_VERSION_MAJOR:
-            raise ValueError('unknown pcapng version {0}.{1}'.format(shb.v_major, shb.v_minor,))
+        self._read_shb(buf)
 
         # look for a mandatory IDB
-        idb = None
         while 1:
             buf = self.__f.read(8)
             if len(buf) < 8:
                 break
 
             blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
+
+            if blk_type == PCAPNG_BT_SHB:
+                # a new section starts before any IDB was seen
+                self._read_shb(buf)
+                continue
+
             buf += self.__f.read(blk_len - 8)
 
             if blk_type == PCAPNG_BT_IDB:
-                idb = (InterfaceDescriptionBlockLE(buf) if self.__le
-                       else InterfaceDescriptionBlock(buf))
+                self._add_idb(buf)
                 break
             # just skip other blocks
 
-        if idb is None:
+        if not self._idbs:
             raise ValueError('IDB not found')
 
-        # set timestamp resolution and offset
-        self._divisor = 1000000  # defaults
-        self._tsoffset = 0
+        self.filter = ''
+        self.__iter = iter(self)
+
+    def _read_shb(self, buf):
+        """Unpack a Section Header Block whose first 8 bytes are in buf.
+
+        Sets the byte order for the new section and resets the interface
+        state, since interface numbering restarts in every section.
+        """
+        shb = SectionHeaderBlock()
+        hdr_len = shb.__hdr_len__
+
+        hdr_buf = buf + self.__f.read(hdr_len - len(buf))
+        if len(hdr_buf) < hdr_len:
+            raise ValueError('truncated section header block')
+
+        # unpack just the header since endianness is not known yet
+        shb.unpack_hdr(hdr_buf)
+
+        # determine the correct byte order and reload the full SHB
+        if shb.bom == BYTE_ORDER_MAGIC_LE:
+            le = True
+            blk_len = _swap32b(shb.len)
+        elif shb.bom == BYTE_ORDER_MAGIC:
+            le = False
+            blk_len = shb.len
+        else:
+            raise ValueError('unknown endianness')
+
+        if blk_len < hdr_len:
+            raise ValueError('invalid section header block length {0}'.format(blk_len))
+
+        buf = hdr_buf + self.__f.read(blk_len - hdr_len)
+        if len(buf) < blk_len:
+            raise ValueError('truncated section header block')
+
+        shb = SectionHeaderBlockLE(buf) if le else SectionHeaderBlock(buf)
+
+        # check if this version is supported
+        if shb.v_major != PCAPNG_VERSION_MAJOR:
+            raise ValueError('unknown pcapng version {0}.{1}'.format(shb.v_major, shb.v_minor,))
+
+        self.__le = le
+        self._section += 1
+        # interface numbering restarts in every section
+        del self._idbs[:]
+        del self._tsinfo[:]
+        return shb
+
+    def _add_idb(self, buf):
+        """Unpack an Interface Description Block and register it as the next
+        interface of the current section."""
+        idb = (InterfaceDescriptionBlockLE(buf) if self.__le
+               else InterfaceDescriptionBlock(buf))
+
+        # timestamp resolution and offset
+        divisor = 1000000  # defaults
+        tsoffset = 0
         for opt in idb.opts:
             if opt.code == PCAPNG_OPT_IF_TSRESOL:
                 # if MSB=0, the remaining bits is a neg power of 10 (e.g. 6 means microsecs)
                 # if MSB=1, the remaining bits is a neg power of 2 (e.g. 10 means 1/1024 of second)
                 opt_val = struct_unpack('b', opt.data)[0]
                 pow_num = 2 if opt_val & 0b10000000 else 10
-                self._divisor = pow_num ** (opt_val & 0b01111111)
+                divisor = pow_num ** (opt_val & 0b01111111)
 
             elif opt.code == PCAPNG_OPT_IF_TSOFFSET:
                 # 64-bit int that specifies an offset (in seconds) that must be added to the
                 # timestamp of each packet
-                self._tsoffset = struct_unpack('<q' if self.__le else '>q', opt.data)[0]
+                tsoffset = struct_unpack('<q' if self.__le else '>q', opt.data)[0]
 
-        if idb.linktype in dltoff:
-            self.dloff = dltoff[idb.linktype]
-        else:
-            self.dloff = 0
+        self._idbs.append(idb)
+        self._tsinfo.append((divisor, tsoffset))
 
-        self.idb = idb
-        self.snaplen = idb.snaplen
-        self.filter = ''
-        self.__iter = iter(self)
+        if len(self._idbs) == 1:
+            # expose the first interface of the section for backwards compatibility
+            self.idb = idb
+            self.snaplen = idb.snaplen
+            self.dloff = dltoff.get(idb.linktype, 0)
+
+        return idb
+
+    def _read_block(self):
+        """Read one block from the file.
+
+        Return a (block_type, buf) tuple, or None on clean EOF. Section
+        Header Blocks are processed internally and returned as
+        (PCAPNG_BT_SHB, None).
+        """
+        buf = self.__f.read(8)
+        if not buf:
+            return None
+        if len(buf) < 8:
+            raise ValueError('truncated block header in {0}'.format(self.name))
+
+        blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
+
+        if blk_type == PCAPNG_BT_SHB:
+            self._read_shb(buf)
+            return (blk_type, None)
+
+        if blk_len < 12:
+            raise ValueError('invalid block length {0} in {1}'.format(blk_len, self.name))
+
+        body = self.__f.read(blk_len - 8)
+        if len(body) < blk_len - 8:
+            raise ValueError('truncated block in {0}: expected {1} bytes, got {2}'.format(
+                self.name, blk_len, 8 + len(body)))
+        buf += body
+
+        # verify the duplicate block total length at the end of the block
+        tail_len = struct_unpack('<I' if self.__le else '>I', buf[-4:])[0]
+        if tail_len != blk_len:
+            raise ValueError(
+                'block total length mismatch in {0}: header {1}, trailer {2}'.format(
+                    self.name, blk_len, tail_len))
+
+        return (blk_type, buf)
 
     @property
     def fd(self):
@@ -642,7 +805,12 @@ class Reader(object):
         return self.fd
 
     def datalink(self):
-        return self.idb.linktype
+        if len(self._idbs) != 1:
+            raise ValueError(
+                'datalink() is ambiguous with {0} interfaces in the current section; '
+                'use iter_packets() to get the link type of each packet'.format(
+                    len(self._idbs)))
+        return self._idbs[0].linktype
 
     def setfilter(self, value, optimize=1):
         raise NotImplementedError
@@ -685,24 +853,62 @@ class Reader(object):
         self.dispatch(0, callback, *args)
 
     def __iter__(self):
+        # legacy iteration: yield (ts, pkt) tuples; Simple Packet Blocks are
+        # skipped since they carry no timestamp
+        for pkt in self.iter_packets():
+            if pkt.ts is not None:
+                yield (pkt.ts, pkt.data)
+
+    def iter_packets(self):
+        """Iterate over packets, yielding PcapngPacket namedtuples.
+
+        Each packet carries the index of its section, its interface id and
+        link type, and a timestamp computed with the resolution and offset
+        of the interface it was captured on. Simple Packet Blocks carry no
+        timestamp, so their ts is None.
+        """
         while 1:
-            buf = self.__f.read(8)
-            if len(buf) < 8:
+            blk = self._read_block()
+            if blk is None:
                 break
+            blk_type, buf = blk
 
-            blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
-            buf += self.__f.read(blk_len - 8)
+            if blk_type == PCAPNG_BT_IDB:
+                self._add_idb(buf)
 
-            if blk_type == PCAPNG_BT_EPB:
+            elif blk_type == PCAPNG_BT_EPB:
                 epb = EnhancedPacketBlockLE(buf) if self.__le else EnhancedPacketBlock(buf)
-                ts = self._tsoffset + (((epb.ts_high << 32) | epb.ts_low) / self._divisor)
-                yield (ts, epb.pkt_data)
+                yield self._make_packet(epb.iface_id, epb.pkt_data,
+                                        (epb.ts_high << 32) | epb.ts_low)
+
             elif blk_type == PCAPNG_BT_PB:
                 pb = PacketBlockLE(buf) if self.__le else PacketBlock(buf)
-                ts = self._tsoffset + (((pb.ts_high << 32) | pb.ts_low) / self._divisor)
-                yield (ts, pb.pkt_data)
+                yield self._make_packet(pb.iface_id, pb.pkt_data,
+                                        (pb.ts_high << 32) | pb.ts_low)
+
+            elif blk_type == PCAPNG_BT_SPB:
+                spb = SimplePacketBlockLE(buf) if self.__le else SimplePacketBlock(buf)
+                if not self._idbs:
+                    raise ValueError(
+                        'simple packet block before any interface description in {0}'.format(
+                            self.name))
+                # SPB carries no interface id and no timestamp; it implicitly
+                # belongs to interface 0 of the current section
+                yield PcapngPacket(ts=None, data=spb.pkt_data, section=self._section,
+                                   iface=0, linktype=self._idbs[0].linktype)
 
             # just ignore other blocks
+
+    def _make_packet(self, iface_id, pkt_data, ts_raw):
+        """Build a PcapngPacket, resolving the interface and its timestamp."""
+        if iface_id >= len(self._idbs):
+            raise ValueError(
+                'packet references unknown interface id {0} in section {1} of {2}'.format(
+                    iface_id, self._section, self.name))
+        divisor, tsoffset = self._tsinfo[iface_id]
+        ts = tsoffset + (ts_raw / divisor)
+        return PcapngPacket(ts=ts, data=pkt_data, section=self._section,
+                            iface=iface_id, linktype=self._idbs[iface_id].linktype)
 
 
 #########
@@ -1521,3 +1727,187 @@ def test_posttest():
         fun()
     except Exception as e:
         assert str(e) == 'No test type specified'
+
+
+def _multi_section_buf():
+    """Build a pcapng buffer with 2 sections of different byte order,
+    each with 2 interfaces using different link types and timestamp
+    resolutions."""
+    # section 0: little endian
+    shb1 = SectionHeaderBlockLE()
+    # iface 0: ethernet, microsecond resolution (10^-6)
+    idb1_0 = InterfaceDescriptionBlockLE(linktype=DLT_EN10MB, snaplen=1500, opts=[
+        PcapngOptionLE(code=PCAPNG_OPT_IF_TSRESOL, data=b'\x06'),
+        PcapngOptionLE()
+    ])
+    # iface 1: linux sll, nanosecond resolution (10^-9), 100s offset
+    idb1_1 = InterfaceDescriptionBlockLE(linktype=DLT_LINUX_SLL, snaplen=1500, opts=[
+        PcapngOptionLE(code=PCAPNG_OPT_IF_TSRESOL, data=b'\x09'),
+        PcapngOptionLE(code=PCAPNG_OPT_IF_TSOFFSET, data=struct_pack('<q', 100)),
+        PcapngOptionLE()
+    ])
+    epb1_0 = EnhancedPacketBlockLE(iface_id=0, ts_high=0, ts_low=1500000,
+                                   pkt_data=b'\x01\x02\x03\x04')
+    epb1_1 = EnhancedPacketBlockLE(iface_id=1, ts_high=0, ts_low=2500000000,
+                                   pkt_data=b'\x05\x06\x07\x08')
+
+    # section 1: big endian
+    shb2 = SectionHeaderBlock()
+    # iface 0: ppp, binary resolution 2^-10
+    idb2_0 = InterfaceDescriptionBlock(linktype=DLT_PPP, snaplen=1500, opts=[
+        PcapngOption(code=PCAPNG_OPT_IF_TSRESOL, data=b'\x8a'),
+        PcapngOption()
+    ])
+    # iface 1: null, default resolution
+    idb2_1 = InterfaceDescriptionBlock(linktype=DLT_NULL, snaplen=1500, opts=[
+        PcapngOption()
+    ])
+    epb2_0 = EnhancedPacketBlock(iface_id=0, ts_high=0, ts_low=2048,
+                                 pkt_data=b'\x09\x0a\x0b\x0c')
+    epb2_1 = EnhancedPacketBlock(iface_id=1, ts_high=0, ts_low=3000000,
+                                 pkt_data=b'\x0d\x0e\x0f\x10')
+
+    blocks = (shb1, idb1_0, idb1_1, epb1_0, epb1_1,
+              shb2, idb2_0, idb2_1, epb2_0, epb2_1)
+    return b''.join(bytes(b) for b in blocks)
+
+
+def test_multi_section_multi_iface():
+    """Packets from multiple sections/interfaces get the right context"""
+    reader = Reader(BytesIO(_multi_section_buf()))
+
+    # before iteration only the first IDB of the first section is known
+    assert reader.datalink() == DLT_EN10MB
+
+    pkts = list(reader.iter_packets())
+    assert len(pkts) == 4
+
+    # section 0, iface 0: 1500000 us = 1.5 s
+    assert pkts[0].section == 0
+    assert pkts[0].iface == 0
+    assert pkts[0].linktype == DLT_EN10MB
+    assert pkts[0].ts == 1.5
+    assert pkts[0].data == b'\x01\x02\x03\x04'
+
+    # section 0, iface 1: 100 s offset + 2500000000 ns = 102.5 s
+    assert pkts[1].section == 0
+    assert pkts[1].iface == 1
+    assert pkts[1].linktype == DLT_LINUX_SLL
+    assert pkts[1].ts == 102.5
+    assert pkts[1].data == b'\x05\x06\x07\x08'
+
+    # section 1, iface 0: interface numbering restarted; 2048 / 2^10 = 2.0 s
+    assert pkts[2].section == 1
+    assert pkts[2].iface == 0
+    assert pkts[2].linktype == DLT_PPP
+    assert pkts[2].ts == 2.0
+    assert pkts[2].data == b'\x09\x0a\x0b\x0c'
+
+    # section 1, iface 1: default resolution, 3000000 us = 3.0 s
+    assert pkts[3].section == 1
+    assert pkts[3].iface == 1
+    assert pkts[3].linktype == DLT_NULL
+    assert pkts[3].ts == 3.0
+    assert pkts[3].data == b'\x0d\x0e\x0f\x10'
+
+    # with multiple interfaces in the current section, datalink() must not
+    # pretend a single global link type applies to all packets
+    try:
+        reader.datalink()
+    except Exception as e:
+        assert isinstance(e, ValueError)
+    else:
+        raise AssertionError('datalink() should fail with multiple interfaces')
+
+
+def test_multi_section_legacy_iter():
+    """Legacy (ts, pkt) iteration works across sections and interfaces"""
+    reader = Reader(BytesIO(_multi_section_buf()))
+    pkts = list(reader)
+    assert pkts == [
+        (1.5, b'\x01\x02\x03\x04'),
+        (102.5, b'\x05\x06\x07\x08'),
+        (2.0, b'\x09\x0a\x0b\x0c'),
+        (3.0, b'\x0d\x0e\x0f\x10'),
+    ]
+
+
+def test_spb():
+    """Simple Packet Block: pack/unpack roundtrip"""
+    spb = SimplePacketBlockLE(pkt_data=b'\x01\x02\x03')
+    buf = bytes(spb)
+    assert spb.len == 16 + 4  # hdr + padded pkt_data
+
+    spb2 = SimplePacketBlockLE(buf)
+    assert spb2.type == PCAPNG_BT_SPB
+    assert spb2.pkt_len == 3
+    assert spb2.pkt_data == b'\x01\x02\x03'
+
+
+def test_spb_read():
+    """SPB packets get no fabricated timestamp and are skipped by legacy iter"""
+    shb = SectionHeaderBlockLE()
+    idb = InterfaceDescriptionBlockLE(linktype=DLT_EN10MB, opts=[PcapngOptionLE()])
+    spb = SimplePacketBlockLE(pkt_data=b'\x01\x02\x03\x04')
+    epb = EnhancedPacketBlockLE(iface_id=0, ts_high=0, ts_low=1000000,
+                                pkt_data=b'\x05\x06\x07\x08')
+    buf = bytes(shb) + bytes(idb) + bytes(spb) + bytes(epb)
+
+    pkts = list(Reader(BytesIO(buf)).iter_packets())
+    assert len(pkts) == 2
+    # the SPB has no timestamp; none is invented for it
+    assert pkts[0].ts is None
+    assert pkts[0].data == b'\x01\x02\x03\x04'
+    assert pkts[0].iface == 0
+    assert pkts[0].linktype == DLT_EN10MB
+    assert pkts[1].ts == 1.0
+
+    # legacy iteration only yields timestamped packets
+    assert list(Reader(BytesIO(buf))) == [(1.0, b'\x05\x06\x07\x08')]
+
+
+def test_unknown_interface():
+    """A packet referencing an undefined interface id raises a clear error"""
+    shb = SectionHeaderBlockLE()
+    idb = InterfaceDescriptionBlockLE(opts=[PcapngOptionLE()])
+    epb = EnhancedPacketBlockLE(iface_id=3, pkt_data=b'\x01\x02\x03\x04')
+    buf = bytes(shb) + bytes(idb) + bytes(epb)
+
+    try:
+        list(Reader(BytesIO(buf)))
+    except Exception as e:
+        assert isinstance(e, ValueError)
+        assert 'unknown interface id 3' in str(e)
+    else:
+        raise AssertionError('no exception raised')
+
+
+def test_truncated_block():
+    """A truncated block raises a clear read error"""
+    buf = _multi_section_buf()[:-5]
+
+    try:
+        list(Reader(BytesIO(buf)))
+    except Exception as e:
+        assert isinstance(e, ValueError)
+        assert 'truncated block' in str(e)
+    else:
+        raise AssertionError('no exception raised')
+
+
+def test_missing_block_trailer():
+    """A block missing its trailing total length raises a clear read error"""
+    shb = SectionHeaderBlockLE()
+    idb = InterfaceDescriptionBlockLE(opts=[PcapngOptionLE()])
+    epb = bytearray(bytes(EnhancedPacketBlockLE(iface_id=0, pkt_data=b'\x01\x02\x03\x04')))
+    # corrupt the duplicate total length at the end of the block
+    epb[-1] ^= 0xff
+    buf = bytes(shb) + bytes(idb) + bytes(epb)
+
+    try:
+        list(Reader(BytesIO(buf)))
+    except Exception as e:
+        assert isinstance(e, ValueError)
+        assert 'block total length mismatch' in str(e)
+    else:
+        raise AssertionError('no exception raised')
