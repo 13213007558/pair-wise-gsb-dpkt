@@ -463,6 +463,30 @@ def test_frag():
     assert (ip.offset == 1480)
 
 
+def test_frag_no_checksum_reserialize():
+    # a fragment carries an incomplete payload; reserializing it must not
+    # fabricate a transport checksum from the fragment's bytes alone
+    from . import tcp
+
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    ip = IP(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08', p=6, data=t)
+    ip.mf = 1  # first fragment
+    bytes(ip)
+    assert ip.data.sum == 0
+
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    ip = IP(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08', p=6, data=t)
+    ip.offset = 1480  # non-first fragment
+    bytes(ip)
+    assert ip.data.sum == 0
+
+    # a complete datagram keeps the normal automatic checksum computation
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    ip = IP(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08', p=6, data=t)
+    bytes(ip)
+    assert ip.data.sum != 0
+
+
 def test_property_setters():
     ip = IP()
     assert ip.v == 4

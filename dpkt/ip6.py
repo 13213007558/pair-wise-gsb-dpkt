@@ -79,11 +79,17 @@ class IP6(dpkt.Packet):
             buf = self.data
 
         next_ext_hdr = self.nxt
+        fragment_hdrs = []
 
         while next_ext_hdr in EXT_HDRS:
             ext = EXT_HDRS_CLS[next_ext_hdr](buf)
+            if len(buf) < ext.length:
+                # the extension header extends past the end of the captured data
+                raise dpkt.NeedData('truncated extension header')
             self.extension_hdrs[next_ext_hdr] = ext
             self.all_extension_headers.append(ext)
+            if isinstance(ext, IP6FragmentHeader):
+                fragment_hdrs.append(ext)
             buf = buf[ext.length:]
             next_ext_hdr = getattr(ext, 'nxt', None)
 
@@ -91,9 +97,18 @@ class IP6(dpkt.Packet):
         if next_ext_hdr is not None:
             self.p = next_ext_hdr
 
-        # do not decode fragments after the first fragment
+        # Do not decode the payload as a transport protocol when it is not a
+        # complete, unfragmented datagram:
+        # - a non-first fragment (frag_off > 0) does not start with a transport
+        #   header, so decoding it would surface phantom ports/flags;
+        # - RFC 8200 allows at most one Fragment header per packet, so a chain
+        #   with duplicates is malformed and its payload offsets cannot be
+        #   trusted either.
+        # The raw payload and the parsed fragment metadata (in
+        # .all_extension_headers) are kept for the caller; no reassembly is
+        # attempted here.
         # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
+        if fragment_hdrs and (len(fragment_hdrs) > 1 or fragment_hdrs[0].frag_off > 0):
             self.data = buf
             return
 
@@ -120,12 +135,29 @@ class IP6(dpkt.Packet):
                     header_str += bytes(self.extension_hdrs[hdr])
         return nxt, header_str
 
+    def _is_fragmented(self):
+        """Return True if this packet is part of a fragmented datagram.
+
+        Atomic fragments (offset 0, M flag clear) carry a complete payload and
+        do not count as fragmented here.
+        """
+        frag_hdrs = [hdr for hdr in getattr(self, 'all_extension_headers', [])
+                     if isinstance(hdr, IP6FragmentHeader)]
+        if not frag_hdrs:
+            legacy = getattr(self, 'extension_hdrs', {}).get(ip.IP_PROTO_FRAGMENT)
+            if legacy is not None:
+                frag_hdrs = [legacy]
+        return any(hdr.frag_off > 0 or hdr.m_flag for hdr in frag_hdrs)
+
     def __bytes__(self):
         self.p, hdr_str = self.headers_str()
 
-        # set TCP, UDP, and ICMPv6 checksums
+        # set TCP, UDP, and ICMPv6 checksums; skip fragments, whose payload is
+        # incomplete, so a checksum computed from it would not match the
+        # reassembled datagram
         if ((self.p == 6 or self.p == 17 or self.p == 58) and
-           hasattr(self.data, 'sum') and not self.data.sum):
+           hasattr(self.data, 'sum') and not self.data.sum and
+           not self._is_fragmented()):
             p = bytes(self.data)
             s = struct.pack('>16s16sxBH', self.src, self.dst, self.p, len(p))
             s = dpkt.in_cksum_add(0, s)
@@ -587,3 +619,132 @@ def test_ip6_fragment_no_decode():  # https://github.com/kbandla/dpkt/issues/575
 
     # test packing
     assert bytes(frag2) == s
+
+
+def _ip6_hdr(plen, nxt):
+    return (b'\x60\x00\x00\x00' + struct.pack('>H', plen) + bytes([nxt, 64]) +
+            b'\x00' * 15 + b'\x01' + b'\x00' * 15 + b'\x02')
+
+
+def _tcp_looking_payload():
+    # bytes that parse as a valid TCP header (sport=80, dport=443, data offset 5)
+    return b'\x00\x50\x01\xbb' + b'\x00' * 8 + b'\x50\x02\x20\x00' + b'\x00' * 4
+
+
+def _fragment_hdr(nxt, frag_off, m_flag, frag_id=1):
+    return (bytes([nxt, 0]) + struct.pack('>H', (frag_off << 3) | m_flag) +
+            struct.pack('>I', frag_id))
+
+
+def test_ip6_nonfirst_fragment_after_other_ext_hdrs():
+    # https://github.com/kbandla/dpkt/issues/575 follow-up: the old check only
+    # looked at self.nxt, so a Fragment header preceded by Hop-by-Hop or
+    # Routing headers let non-first fragments be decoded as TCP/UDP.
+    payload = _tcp_looking_payload()
+    frag = _fragment_hdr(6, frag_off=8, m_flag=1)  # nxt=TCP, non-first fragment
+
+    for chain_nxt, chain in (
+            (0, b'\x2c\x00' + b'\x00' * 6),                  # Hop-by-Hop -> Fragment
+            (43, b'\x2c\x00\x00\x00\x00\x00\x00\x00')):      # Routing -> Fragment
+        s = _ip6_hdr(len(chain) + 8 + len(payload), chain_nxt) + chain + frag + payload
+        ip6 = IP6(s)
+        # payload must stay raw bytes; no phantom TCP ports
+        assert type(ip6.data) is bytes
+        assert ip6.data == payload
+        assert not hasattr(ip6, 'tcp')
+        # fragment metadata is still available
+        frags = [h for h in ip6.all_extension_headers if isinstance(h, IP6FragmentHeader)]
+        assert len(frags) == 1
+        assert frags[0].frag_off == 8
+        assert frags[0].m_flag == 1
+        assert frags[0].id == 1
+        # round-trip must be byte-exact
+        assert bytes(ip6) == s
+
+
+def test_ip6_first_fragment_still_decodes():
+    payload = _tcp_looking_payload()
+    frag = _fragment_hdr(6, frag_off=0, m_flag=1)  # first fragment
+    hopopts = b'\x2c\x00' + b'\x00' * 6
+    s = _ip6_hdr(len(hopopts) + 8 + len(payload), 0) + hopopts + frag + payload
+    ip6 = IP6(s)
+    assert isinstance(ip6.data, tcp.TCP)
+    assert ip6.tcp.sport == 80
+    assert ip6.tcp.dport == 443
+
+
+def test_ip6_atomic_fragment_decodes():
+    # TCP-looking payload with a nonzero checksum so reserialization is exact
+    payload = b'\x00\x50\x01\xbb' + b'\x00' * 8 + b'\x50\x02\x20\x00' + b'\x12\x34\x00\x00'
+    frag = _fragment_hdr(6, frag_off=0, m_flag=0)  # atomic fragment: complete datagram
+    s = _ip6_hdr(8 + len(payload), 44) + frag + payload
+    ip6 = IP6(s)
+    assert isinstance(ip6.data, tcp.TCP)
+    assert bytes(ip6) == s
+
+
+def test_ip6_duplicate_fragment_headers_not_decoded():
+    # RFC 8200 allows at most one Fragment header; a chain with duplicates is
+    # malformed, so the payload must not be surfaced as a transport protocol.
+    payload = _tcp_looking_payload()
+    frag1 = _fragment_hdr(44, frag_off=0, m_flag=0)
+    frag2 = _fragment_hdr(6, frag_off=0, m_flag=0)
+    s = _ip6_hdr(16 + len(payload), 44) + frag1 + frag2 + payload
+    ip6 = IP6(s)
+    assert type(ip6.data) is bytes
+    assert ip6.data == payload
+    assert not hasattr(ip6, 'tcp')
+    assert bytes(ip6) == s
+
+
+def test_ip6_truncated_extension_header():
+    import pytest
+    # Hop-by-Hop header declares 16 bytes but the payload is shorter
+    s = _ip6_hdr(12, 0) + b'\x06\x01' + b'\x00' * 10
+    with pytest.raises(dpkt.NeedData):
+        IP6(s)
+
+
+def test_ip6_fragment_no_checksum_on_reserialize():
+    # a first fragment carries an incomplete payload; reserializing it must
+    # not fabricate a TCP checksum from the fragment's bytes alone
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    fh = IP6FragmentHeader(nxt=6, id=0x1234)
+    fh.frag_off = 0
+    fh.m_flag = 1
+    ip6 = IP6(src=b'\x00' * 15 + b'\x01', dst=b'\x00' * 15 + b'\x02', hlim=64, nxt=44, data=t)
+    ip6.all_extension_headers = [fh]
+    ip6.plen = 8 + len(t)
+    bytes(ip6)
+    assert ip6.data.sum == 0
+
+    # atomic fragments and non-fragmented packets are complete and keep the
+    # normal automatic checksum computation
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    fh = IP6FragmentHeader(nxt=6, id=0x1234)
+    ip6 = IP6(src=b'\x00' * 15 + b'\x01', dst=b'\x00' * 15 + b'\x02', hlim=64, nxt=44, data=t)
+    ip6.all_extension_headers = [fh]
+    ip6.plen = 8 + len(t)
+    bytes(ip6)
+    assert ip6.data.sum != 0
+
+    t = tcp.TCP(sport=1, dport=2, win=8192)
+    ip6 = IP6(src=b'\x00' * 15 + b'\x01', dst=b'\x00' * 15 + b'\x02', hlim=64, nxt=6, data=t)
+    ip6.plen = len(t)
+    bytes(ip6)
+    assert ip6.data.sum != 0
+
+
+def test_ip6_nonfirst_fragment_ethernet_roundtrip():
+    from .ethernet import Ethernet
+    payload = _tcp_looking_payload()
+    frag = _fragment_hdr(6, frag_off=8, m_flag=1, frag_id=0xdeadbeef)
+    hopopts = b'\x2c\x00' + b'\x00' * 6
+    ip6 = _ip6_hdr(len(hopopts) + 8 + len(payload), 0) + hopopts + frag + payload
+    frame = (b'\xaa\xbb\xcc\xdd\xee\xff' + b'\x11\x22\x33\x44\x55\x66' +
+             b'\x86\xdd' + ip6)
+    eth = Ethernet(frame)
+    assert type(eth.ip6.data) is bytes
+    assert not hasattr(eth.ip6, 'tcp')
+    # no field may be silently rewritten on the way out
+    assert bytes(eth) == frame
