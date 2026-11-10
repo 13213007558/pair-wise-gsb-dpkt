@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+- Fixed `pcapng.Reader` handling of concatenated files with multiple sections:
+  each Section Header Block now resets the interface id space and switches the
+  byte order for its whole section, and every packet is decoded using the
+  timestamp resolution, offset and linktype of the interface it references
+- Added `pcapng.Reader.iter_packets()` yielding `PacketRecord` objects that
+  expose packet data, timestamp, raw ticks, linktype and the originating
+  `Interface` (section and interface id); the legacy `(timestamp, packet)`
+  tuple iteration remains supported
+- `pcapng.Reader` now fails explicitly on unknown interface ids, mismatched
+  block head/tail lengths and truncated blocks instead of reusing a previous
+  section's interface
+
 ## 1.9.8
 **[2022-08-17]**
 - Fixed endianness issues in PCAPNG, Loopback
