@@ -455,6 +455,14 @@ dpkt.ssl_ciphersuites module
     :undoc-members:
     :show-inheritance:
 
+dpkt.tls_reassembly module
+--------------------------
+
+.. automodule:: dpkt.tls_reassembly
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.stp module
 ---------------
 
